@@ -1167,6 +1167,18 @@ func (s *State) UpdateTailnetCache(tn types.Tailnet) {
 	s.tailnetCacheMu.Unlock()
 }
 
+// RegisterTailnetAllocator adds or replaces the IP allocator for a tailnet.
+// Called when a new tailnet is created at runtime.
+func (s *State) RegisterTailnetAllocator(tailnetID uint, prefix4, prefix6 *netip.Prefix) error {
+	return s.ipAlloc.RegisterTailnet(s.db, tailnetID, prefix4, prefix6)
+}
+
+// GetDB exposes the underlying database for direct operations.
+// Used by API handlers for CRUD that doesn't need State coordination.
+func (s *State) GetDB() *hsdb.HSDatabase {
+	return s.db
+}
+
 // ---------------------------------------------------------------------------
 
 // SSHPolicy returns the SSH access policy for a node.

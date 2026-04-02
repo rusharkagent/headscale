@@ -506,6 +506,18 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 
 	r.Route("/api", func(r chi.Router) {
 		r.Use(h.httpAuthenticationMiddleware)
+
+		// Tailnet management REST API (multi-tenancy).
+		// Registered before the wildcard so these paths take priority.
+		r.Route("/v1/tailnet", func(r chi.Router) {
+			r.Get("/", h.listTailnets)
+			r.Post("/", h.createTailnet)
+			r.Get("/{id}", h.getTailnet)
+			r.Put("/{id}", h.updateTailnet)
+			r.Delete("/{id}", h.deleteTailnet)
+			r.Put("/{id}/policy", h.setTailnetPolicy)
+		})
+
 		r.HandleFunc("/v1/*", grpcMux.ServeHTTP)
 	})
 	r.Get("/favicon.ico", FaviconHandler)
