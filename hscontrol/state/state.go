@@ -90,8 +90,18 @@ type State struct {
 	ipAlloc *hsdb.TailnetIPAllocator
 	// derpMap contains the current DERP relay configuration
 	derpMap atomic.Pointer[tailcfg.DERPMap]
-	// polMan handles policy evaluation and management
+	// polMan is the global (default) policy manager — used when no per-tailnet override exists.
 	polMan policy.PolicyManager
+
+	// perTailnetPolMan holds per-tailnet policy managers for tailnets that have their own ACL.
+	// Key: Tailnet.ID (uint). Falls back to polMan when no entry exists.
+	perTailnetPolMan   map[uint]policy.PolicyManager
+	perTailnetPolManMu sync.RWMutex
+
+	// tailnetCache is an in-memory snapshot of the tailnets table for fast BaseDomain lookups.
+	// Updated on startup and when tailnets change.
+	tailnetCache   map[uint]types.Tailnet
+	tailnetCacheMu sync.RWMutex
 
 	// authCache caches any pending authentication requests, from either auth type (Web and OIDC).
 	authCache *zcache.Cache[types.AuthID, types.AuthRequest]
@@ -188,6 +198,49 @@ func NewState(cfg *types.Config) (*State, error) {
 		return nil, fmt.Errorf("initializing policy manager: %w", err)
 	}
 
+	// Load tailnets for per-tailnet policy managers and BaseDomain cache.
+	tailnets, err := db.ListTailnets()
+	if err != nil {
+		return nil, fmt.Errorf("loading tailnets: %w", err)
+	}
+
+	// Build tailnet cache and per-tailnet policy managers.
+	tailnetCache := make(map[uint]types.Tailnet, len(tailnets))
+	perTailnetPolMan := make(map[uint]policy.PolicyManager)
+
+	for _, tn := range tailnets {
+		tailnetCache[tn.ID] = tn
+
+		if tn.ACLPolicy == "" {
+			continue
+		}
+
+		// Build node/user slices scoped to this tailnet for the policy manager.
+		var tnUsers []types.User
+		for _, u := range users {
+			if u.TailnetID != nil && *u.TailnetID == tn.ID {
+				tnUsers = append(tnUsers, u)
+			}
+		}
+
+		var tnNodeViews []types.NodeView
+		for _, n := range nodes {
+			if n.TailnetID != nil && *n.TailnetID == tn.ID {
+				tnNodeViews = append(tnNodeViews, n.View())
+			}
+		}
+
+		pm, err := policy.NewPolicyManager([]byte(tn.ACLPolicy), tnUsers, views.SliceOf(tnNodeViews))
+		if err != nil {
+			log.Warn().Err(err).Uint("tailnet.id", tn.ID).Str("tailnet.name", tn.Name).
+				Msg("failed to load per-tailnet policy manager, falling back to global policy")
+
+			continue
+		}
+
+		perTailnetPolMan[tn.ID] = pm
+	}
+
 	// Apply defaults for NodeStore batch configuration if not set.
 	// This ensures tests that create Config directly (without viper) still work.
 	batchSize := cfg.Tuning.NodeStoreBatchSize
@@ -204,12 +257,11 @@ func NewState(cfg *types.Config) (*State, error) {
 	// This moves the complex peer relationship logic into the policy package where it belongs.
 	//
 	// MULTI-TENANCY: The PeersFunc groups nodes by tailnet before calling BuildPeerMap.
-	// This ensures nodes in different tailnets are never returned as peers of each other,
-	// providing hard isolation at the peer-map level — independent of ACL policy.
+	// Per-tailnet policy managers are used when available; global polMan is the fallback.
+	// Nodes in different tailnets are structurally prevented from being each other's peers.
 	nodeStore := NewNodeStore(
 		nodes,
 		func(allNodes []types.NodeView) map[types.NodeID][]types.NodeView {
-			// Group all nodes by tailnet (nil TailnetID → key 0 = default tailnet).
 			byTailnet := make(map[uint][]types.NodeView)
 			for _, n := range allNodes {
 				tid := uint(0)
@@ -220,11 +272,15 @@ func NewState(cfg *types.Config) (*State, error) {
 				byTailnet[tid] = append(byTailnet[tid], n)
 			}
 
-			// Build peer map per-tailnet and merge.
-			// Cross-tailnet peers are structurally impossible.
 			result := make(map[types.NodeID][]types.NodeView)
-			for _, tailnetNodes := range byTailnet {
-				peers := polMan.BuildPeerMap(views.SliceOf(tailnetNodes))
+			for tailnetID, tailnetNodes := range byTailnet {
+				// Use per-tailnet policy manager when available.
+				pm, ok := perTailnetPolMan[tailnetID]
+				if !ok || tailnetID == 0 {
+					pm = polMan
+				}
+
+				peers := pm.BuildPeerMap(views.SliceOf(tailnetNodes))
 				for nodeID, nodePeers := range peers {
 					result[nodeID] = nodePeers
 				}
@@ -237,18 +293,22 @@ func NewState(cfg *types.Config) (*State, error) {
 	)
 	nodeStore.Start()
 
-	return &State{
+	s := &State{
 		cfg: cfg,
 
-		db:            db,
-		ipAlloc:       ipAlloc,
-		polMan:        polMan,
-		authCache:     authCache,
-		primaryRoutes: routes.New(),
-		nodeStore:     nodeStore,
+		db:               db,
+		ipAlloc:          ipAlloc,
+		polMan:           polMan,
+		perTailnetPolMan: perTailnetPolMan,
+		tailnetCache:     tailnetCache,
+		authCache:        authCache,
+		primaryRoutes:    routes.New(),
+		nodeStore:        nodeStore,
 
 		sshCheckAuth: make(map[sshCheckPair]time.Time),
-	}, nil
+	}
+
+	return s, nil
 }
 
 // Close gracefully shuts down the State instance and releases all resources.
@@ -840,7 +900,7 @@ func (s *State) SetNodeTags(nodeID types.NodeID, tags []string) (types.NodeView,
 	invalidTags := make([]string, 0)
 
 	for _, tag := range tags {
-		if !strings.HasPrefix(tag, "tag:") || !s.polMan.TagExists(tag) {
+		if !strings.HasPrefix(tag, "tag:") || !s.getPolManForNode(existingNode).TagExists(tag) {
 			invalidTags = append(invalidTags, tag)
 
 			continue
@@ -1015,9 +1075,103 @@ func (s *State) ExpireExpiredNodes(lastCheck time.Time) (time.Time, []change.Cha
 	return started, nil, false
 }
 
+// ---------------------------------------------------------------------------
+// Per-tailnet policy + DNS helpers
+// ---------------------------------------------------------------------------
+
+// getPolManForTailnet returns the PolicyManager for the given tailnet.
+// Falls back to the global polMan when no per-tailnet override exists.
+func (s *State) getPolManForTailnet(tailnetID uint) policy.PolicyManager {
+	if tailnetID != 0 {
+		s.perTailnetPolManMu.RLock()
+		pm, ok := s.perTailnetPolMan[tailnetID]
+		s.perTailnetPolManMu.RUnlock()
+
+		if ok {
+			return pm
+		}
+	}
+
+	return s.polMan
+}
+
+// getPolManForNode returns the PolicyManager scoped to the given node's tailnet.
+func (s *State) getPolManForNode(node types.NodeView) policy.PolicyManager {
+	tailnetID := uint(0)
+	if v, ok := node.TailnetID().GetOk(); ok {
+		tailnetID = v
+	}
+
+	return s.getPolManForTailnet(tailnetID)
+}
+
+// BaseDomainForNode returns the MagicDNS base domain for the given node's tailnet.
+// Falls back to the global config BaseDomain when the tailnet has no override.
+func (s *State) BaseDomainForNode(node types.NodeView) string {
+	tailnetID := uint(0)
+	if v, ok := node.TailnetID().GetOk(); ok {
+		tailnetID = v
+	}
+
+	if tailnetID != 0 {
+		s.tailnetCacheMu.RLock()
+		tn, ok := s.tailnetCache[tailnetID]
+		s.tailnetCacheMu.RUnlock()
+
+		if ok && tn.BaseDomain != "" {
+			return tn.BaseDomain
+		}
+	}
+
+	return s.cfg.DNSConfig.BaseDomain
+}
+
+// RegisterTailnetPolicy registers or updates the per-tailnet policy manager.
+// Called when a tailnet's ACLPolicy is created or updated.
+func (s *State) RegisterTailnetPolicy(tailnetID uint, aclPolicy []byte) error {
+	// Build node/user slices scoped to this tailnet.
+	tailnetNodes := s.nodeStore.ListNodesByTailnet(tailnetID)
+
+	users, err := s.ListAllUsers()
+	if err != nil {
+		return fmt.Errorf("listing users for tailnet policy: %w", err)
+	}
+
+	var tnUsers []types.User
+	for _, u := range users {
+		if u.TailnetID != nil && *u.TailnetID == tailnetID {
+			tnUsers = append(tnUsers, u)
+		}
+	}
+
+	pm, err := policy.NewPolicyManager(aclPolicy, tnUsers, tailnetNodes)
+	if err != nil {
+		return fmt.Errorf("building policy manager for tailnet %d: %w", tailnetID, err)
+	}
+
+	s.perTailnetPolManMu.Lock()
+	s.perTailnetPolMan[tailnetID] = pm
+	s.perTailnetPolManMu.Unlock()
+
+	// Rebuild peer maps so the new ACL takes effect immediately.
+	s.nodeStore.RebuildPeerMaps()
+
+	return nil
+}
+
+// UpdateTailnetCache refreshes the tailnet cache entry for a given tailnet.
+// Call this after a tailnet's BaseDomain or other metadata changes.
+func (s *State) UpdateTailnetCache(tn types.Tailnet) {
+	s.tailnetCacheMu.Lock()
+	s.tailnetCache[tn.ID] = tn
+	s.tailnetCacheMu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+
 // SSHPolicy returns the SSH access policy for a node.
 func (s *State) SSHPolicy(node types.NodeView) (*tailcfg.SSHPolicy, error) {
-	return s.polMan.SSHPolicy(s.cfg.ServerURL, node)
+	return s.getPolManForNode(node).SSHPolicy(s.cfg.ServerURL, node)
 }
 
 // SSHCheckParams resolves the SSH check period for a source-destination
@@ -1035,17 +1189,17 @@ func (s *State) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
 
 // FilterForNode returns filter rules for a specific node, handling autogroup:self per-node.
 func (s *State) FilterForNode(node types.NodeView) ([]tailcfg.FilterRule, error) {
-	return s.polMan.FilterForNode(node)
+	return s.getPolManForNode(node).FilterForNode(node)
 }
 
 // MatchersForNode returns matchers for peer relationship determination (unreduced).
 func (s *State) MatchersForNode(node types.NodeView) ([]matcher.Match, error) {
-	return s.polMan.MatchersForNode(node)
+	return s.getPolManForNode(node).MatchersForNode(node)
 }
 
 // NodeCanHaveTag checks if a node is allowed to have a specific tag.
 func (s *State) NodeCanHaveTag(node types.NodeView, tag string) bool {
-	return s.polMan.NodeCanHaveTag(node, tag)
+	return s.getPolManForNode(node).NodeCanHaveTag(node, tag)
 }
 
 // SetPolicy updates the policy configuration.
@@ -1064,7 +1218,7 @@ func (s *State) SetPolicy(pol []byte) (bool, error) {
 // AutoApproveRoutes checks if a node's routes should be auto-approved.
 // AutoApproveRoutes checks if any routes should be auto-approved for a node and updates them.
 func (s *State) AutoApproveRoutes(nv types.NodeView) (change.Change, error) {
-	approved, changed := policy.ApproveRoutesWithPolicy(s.polMan, nv, nv.ApprovedRoutes().AsSlice(), nv.AnnouncedRoutes())
+	approved, changed := policy.ApproveRoutesWithPolicy(s.getPolManForNode(nv), nv, nv.ApprovedRoutes().AsSlice(), nv.AnnouncedRoutes())
 	if changed {
 		log.Debug().
 			EmbedObject(nv).
@@ -1126,7 +1280,7 @@ func (s *State) RoutesForPeer(
 	viewer, peer types.NodeView,
 	matchers []matcher.Match,
 ) []netip.Prefix {
-	viaResult := s.polMan.ViaRoutesForPeer(viewer, peer)
+	viaResult := s.getPolManForNode(viewer).ViaRoutesForPeer(viewer, peer)
 
 	globalPrimaries := s.primaryRoutes.PrimaryRoutes(peer.ID())
 	exitRoutes := peer.ExitRoutes()
@@ -1678,7 +1832,7 @@ func (s *State) validateRequestTags(node types.NodeView, requestTags []string) [
 	var rejectedTags []string
 
 	for _, tag := range requestTags {
-		if !s.polMan.NodeCanHaveTag(node, tag) {
+		if !s.getPolManForNode(node).NodeCanHaveTag(node, tag) {
 			rejectedTags = append(rejectedTags, tag)
 		}
 	}
@@ -1729,7 +1883,7 @@ func (s *State) processReauthTags(
 	var approvedTags, rejectedTags []string
 
 	for _, tag := range requestTags {
-		if s.polMan.NodeCanHaveTag(node.View(), tag) {
+		if s.getPolManForNode(node.View()).NodeCanHaveTag(node.View(), tag) {
 			approvedTags = append(approvedTags, tag)
 		} else {
 			rejectedTags = append(rejectedTags, tag)
@@ -2252,6 +2406,23 @@ func (s *State) updatePolicyManagerUsers() (change.Change, error) {
 		return change.Change{}, fmt.Errorf("updating policy manager users: %w", err)
 	}
 
+	// Also update per-tailnet policy managers with their scoped user lists.
+	s.perTailnetPolManMu.RLock()
+	for tailnetID, pm := range s.perTailnetPolMan {
+		var tnUsers []types.User
+		for _, u := range users {
+			if u.TailnetID != nil && *u.TailnetID == tailnetID {
+				tnUsers = append(tnUsers, u)
+			}
+		}
+
+		if _, err := pm.SetUsers(tnUsers); err != nil {
+			log.Warn().Err(err).Uint("tailnet.id", tailnetID).
+				Msg("failed to update per-tailnet policy manager users")
+		}
+	}
+	s.perTailnetPolManMu.RUnlock()
+
 	log.Debug().Caller().Bool("policy.changed", changed).Msg("policy manager user update completed because SetUsers operation finished")
 
 	if changed {
@@ -2282,6 +2453,17 @@ func (s *State) updatePolicyManagerNodes() (change.Change, error) {
 	if err != nil {
 		return change.Change{}, fmt.Errorf("updating policy manager nodes: %w", err)
 	}
+
+	// Also update per-tailnet policy managers with their scoped node lists.
+	s.perTailnetPolManMu.RLock()
+	for tailnetID, pm := range s.perTailnetPolMan {
+		tnNodes := s.nodeStore.ListNodesByTailnet(tailnetID)
+		if _, err := pm.SetNodes(tnNodes); err != nil {
+			log.Warn().Err(err).Uint("tailnet.id", tailnetID).
+				Msg("failed to update per-tailnet policy manager nodes")
+		}
+	}
+	s.perTailnetPolManMu.RUnlock()
 
 	if changed {
 		// Rebuild peer maps because policy-affecting node changes (tags, user, IPs)
@@ -2316,7 +2498,7 @@ func (s *State) autoApproveNodes() ([]change.Change, error) {
 	)
 	for _, nv := range nodes.All() {
 		errg.Go(func() error {
-			approved, changed := policy.ApproveRoutesWithPolicy(s.polMan, nv, nv.ApprovedRoutes().AsSlice(), nv.AnnouncedRoutes())
+			approved, changed := policy.ApproveRoutesWithPolicy(s.getPolManForNode(nv), nv, nv.ApprovedRoutes().AsSlice(), nv.AnnouncedRoutes())
 			if changed {
 				log.Debug().
 					Uint64(zf.NodeID, nv.ID().Uint64()).
@@ -2415,7 +2597,7 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 			// Apply policy-based auto-approval if routes are announced
 			if len(announcedRoutes) > 0 {
 				autoApprovedRoutes, routeChange = policy.ApproveRoutesWithPolicy(
-					s.polMan,
+					s.getPolManForNode(currentNode.View()),
 					currentNode.View(),
 					currentNode.ApprovedRoutes,
 					announcedRoutes,

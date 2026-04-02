@@ -84,7 +84,7 @@ func (b *MapResponseBuilder) WithSelfNode() *MapResponseBuilder {
 
 			return slices.Concat(primaries, nv.ExitRoutes())
 		},
-		b.mapper.cfg)
+		b.mapper.cfgForNode(nv))
 	if err != nil {
 		b.addError(err)
 		return b
@@ -261,7 +261,7 @@ func (b *MapResponseBuilder) buildTailPeers(peers views.Slice[types.NodeView]) (
 	for _, peer := range changedViews.All() {
 		tn, err := peer.TailNode(b.capVer, func(_ types.NodeID) []netip.Prefix {
 			return b.mapper.state.RoutesForPeer(node, peer, matchers)
-		}, b.mapper.cfg)
+		}, b.mapper.cfgForNode(peer))
 		if err != nil {
 			return nil, err
 		}

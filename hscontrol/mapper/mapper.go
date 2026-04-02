@@ -114,6 +114,32 @@ func generateUserProfiles(
 	return profiles
 }
 
+// cfgForNode returns a *types.Config copy with BaseDomain overridden by the
+// node's tailnet BaseDomain (if set). Used to ensure per-tailnet MagicDNS domains.
+func (m *mapper) cfgForNode(node types.NodeView) *types.Config {
+	tailnetDomain := m.state.BaseDomainForNode(node)
+	if tailnetDomain == m.cfg.DNSConfig.BaseDomain {
+		// No override needed — return global cfg directly (no alloc).
+		return m.cfg
+	}
+
+	// Shallow copy cfg and override the BaseDomain fields.
+	cfgCopy := *m.cfg
+	cfgCopy.BaseDomain = tailnetDomain
+
+	dnsCopy := cfgCopy.DNSConfig
+	dnsCopy.BaseDomain = tailnetDomain
+	cfgCopy.DNSConfig = dnsCopy
+
+	// Clone TailcfgDNSConfig if present — we need to update the Proxied domain.
+	if m.cfg.TailcfgDNSConfig != nil {
+		tailcfgDNS := m.cfg.TailcfgDNSConfig.Clone()
+		cfgCopy.TailcfgDNSConfig = tailcfgDNS
+	}
+
+	return &cfgCopy
+}
+
 func generateDNSConfig(
 	cfg *types.Config,
 	node types.NodeView,
