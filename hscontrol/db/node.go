@@ -96,6 +96,32 @@ func ListNodes(tx *gorm.DB, nodeIDs ...types.NodeID) (types.Nodes, error) {
 	return nodes, nil
 }
 
+// ListNodesByTailnet returns all nodes belonging to a specific tailnet.
+// tailnetID=0 matches nodes with a NULL tailnet_id (legacy / default tailnet).
+func (hsdb *HSDatabase) ListNodesByTailnet(tailnetID uint) (types.Nodes, error) {
+	return Read(hsdb.DB, func(rx *gorm.DB) (types.Nodes, error) {
+		return listNodesByTailnet(rx, tailnetID)
+	})
+}
+
+func listNodesByTailnet(tx *gorm.DB, tailnetID uint) (types.Nodes, error) {
+	nodes := types.Nodes{}
+
+	q := tx.Preload("AuthKey").Preload("AuthKey.User").Preload("User")
+	if tailnetID == 0 {
+		q = q.Where("tailnet_id IS NULL OR tailnet_id = 0")
+	} else {
+		q = q.Where("tailnet_id = ?", tailnetID)
+	}
+
+	err := q.Find(&nodes).Error
+	if err != nil {
+		return nil, err
+	}
+
+	return nodes, nil
+}
+
 func (hsdb *HSDatabase) ListEphemeralNodes() (types.Nodes, error) {
 	return Read(hsdb.DB, func(rx *gorm.DB) (types.Nodes, error) {
 		nodes := types.Nodes{}

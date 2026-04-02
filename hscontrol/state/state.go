@@ -202,10 +202,35 @@ func NewState(cfg *types.Config) (*State, error) {
 
 	// PolicyManager.BuildPeerMap handles both global and per-node filter complexity.
 	// This moves the complex peer relationship logic into the policy package where it belongs.
+	//
+	// MULTI-TENANCY: The PeersFunc groups nodes by tailnet before calling BuildPeerMap.
+	// This ensures nodes in different tailnets are never returned as peers of each other,
+	// providing hard isolation at the peer-map level — independent of ACL policy.
 	nodeStore := NewNodeStore(
 		nodes,
-		func(nodes []types.NodeView) map[types.NodeID][]types.NodeView {
-			return polMan.BuildPeerMap(views.SliceOf(nodes))
+		func(allNodes []types.NodeView) map[types.NodeID][]types.NodeView {
+			// Group all nodes by tailnet (nil TailnetID → key 0 = default tailnet).
+			byTailnet := make(map[uint][]types.NodeView)
+			for _, n := range allNodes {
+				tid := uint(0)
+				if v, ok := n.TailnetID().GetOk(); ok {
+					tid = v
+				}
+
+				byTailnet[tid] = append(byTailnet[tid], n)
+			}
+
+			// Build peer map per-tailnet and merge.
+			// Cross-tailnet peers are structurally impossible.
+			result := make(map[types.NodeID][]types.NodeView)
+			for _, tailnetNodes := range byTailnet {
+				peers := polMan.BuildPeerMap(views.SliceOf(tailnetNodes))
+				for nodeID, nodePeers := range peers {
+					result[nodeID] = nodePeers
+				}
+			}
+
+			return result
 		},
 		batchSize,
 		batchTimeout,
@@ -687,6 +712,12 @@ func (s *State) ListNodesByUser(userID types.UserID) views.Slice[types.NodeView]
 	return s.nodeStore.ListNodesByUser(userID)
 }
 
+// ListNodesByTailnet retrieves all nodes belonging to a specific tailnet.
+// Use tailnetID=0 for nodes with no assigned tailnet (default/legacy).
+func (s *State) ListNodesByTailnet(tailnetID uint) views.Slice[types.NodeView] {
+	return s.nodeStore.ListNodesByTailnet(tailnetID)
+}
+
 // ListPeers retrieves nodes that can communicate with the specified node based on policy.
 func (s *State) ListPeers(nodeID types.NodeID, peerIDs ...types.NodeID) views.Slice[types.NodeView] {
 	if len(peerIDs) == 0 {
@@ -698,7 +729,21 @@ func (s *State) ListPeers(nodeID types.NodeID, peerIDs ...types.NodeID) views.Sl
 	// where the caller already knows which peer IDs are involved.
 	// The peer visibility filtering happens in the mapper's buildTailPeers
 	// via MatchersForNode/ReduceNodes.
-	allNodes := s.nodeStore.ListNodes()
+	//
+	// MULTI-TENANCY: We resolve the requesting node's tailnet first, then
+	// only return peerIDs that belong to the same tailnet.
+	requestingNode, ok := s.nodeStore.GetNode(nodeID)
+	if !ok {
+		return views.SliceOf[types.NodeView](nil)
+	}
+
+	reqTailnetID := uint(0)
+	if v, ok := requestingNode.TailnetID().GetOk(); ok {
+		reqTailnetID = v
+	}
+
+	// Build peer lookup from the same tailnet only.
+	tailnetNodes := s.nodeStore.ListNodesByTailnet(reqTailnetID)
 
 	nodeIDSet := make(map[types.NodeID]struct{}, len(peerIDs))
 	for _, id := range peerIDs {
@@ -707,7 +752,11 @@ func (s *State) ListPeers(nodeID types.NodeID, peerIDs ...types.NodeID) views.Sl
 
 	var filteredNodes []types.NodeView
 
-	for _, node := range allNodes.All() {
+	for _, node := range tailnetNodes.All() {
+		if node.ID() == nodeID {
+			continue
+		}
+
 		if _, exists := nodeIDSet[node.ID()]; exists {
 			filteredNodes = append(filteredNodes, node)
 		}

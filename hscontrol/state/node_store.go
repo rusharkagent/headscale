@@ -127,6 +127,7 @@ type Snapshot struct {
 	nodesByMachineKey map[key.MachinePublic]map[types.UserID]types.NodeView
 	peersByNode       map[types.NodeID][]types.NodeView
 	nodesByUser       map[types.UserID][]types.NodeView
+	nodesByTailnet    map[uint][]types.NodeView // key: TailnetID (0 = default/nil)
 	allNodes          []types.NodeView
 }
 
@@ -411,16 +412,19 @@ func snapshotFromNodes(nodes map[types.NodeID]types.Node, peersFunc PeersFunc) S
 		// it will use the list of all nodes, combined with the
 		// current policy to precalculate which nodes are peers and
 		// can see each other.
+		// The peersFunc is responsible for tailnet scoping: it must
+		// only return peers from the same tailnet as the requesting node.
 		peersByNode: func() map[types.NodeID][]types.NodeView {
 			peersTimer := prometheus.NewTimer(nodeStorePeersCalculationDuration)
 			defer peersTimer.ObserveDuration()
 
 			return peersFunc(allNodes)
 		}(),
-		nodesByUser: make(map[types.UserID][]types.NodeView),
+		nodesByUser:    make(map[types.UserID][]types.NodeView),
+		nodesByTailnet: make(map[uint][]types.NodeView),
 	}
 
-	// Build nodesByUser, nodesByNodeKey, and nodesByMachineKey maps
+	// Build nodesByUser, nodesByNodeKey, nodesByMachineKey, and nodesByTailnet maps
 	for _, n := range nodes {
 		nodeView := n.View()
 		userID := n.TypedUserID()
@@ -439,6 +443,14 @@ func snapshotFromNodes(nodes map[types.NodeID]types.Node, peersFunc PeersFunc) S
 		}
 
 		newSnap.nodesByMachineKey[n.MachineKey][userID] = nodeView
+
+		// Build tailnet index: TailnetID nil → key 0 (default tailnet)
+		tid := uint(0)
+		if n.TailnetID != nil {
+			tid = *n.TailnetID
+		}
+
+		newSnap.nodesByTailnet[tid] = append(newSnap.nodesByTailnet[tid], nodeView)
 	}
 
 	return newSnap
@@ -621,4 +633,15 @@ func (s *NodeStore) ListNodesByUser(uid types.UserID) views.Slice[types.NodeView
 	nodeStoreOperations.WithLabelValues("list_by_user").Inc()
 
 	return views.SliceOf(s.data.Load().nodesByUser[uid])
+}
+
+// ListNodesByTailnet returns all nodes belonging to a specific tailnet.
+// Use tailnetID=0 for nodes with no assigned tailnet (default/legacy).
+func (s *NodeStore) ListNodesByTailnet(tailnetID uint) views.Slice[types.NodeView] {
+	timer := prometheus.NewTimer(nodeStoreOperationDuration.WithLabelValues("list_by_tailnet"))
+	defer timer.ObserveDuration()
+
+	nodeStoreOperations.WithLabelValues("list_by_tailnet").Inc()
+
+	return views.SliceOf(s.data.Load().nodesByTailnet[tailnetID])
 }
