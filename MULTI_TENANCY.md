@@ -1,0 +1,209 @@
+# Multi-Tenancy in Headscale
+
+This document describes the multi-tenancy architecture implemented in this fork of [juanfont/headscale](https://github.com/juanfont/headscale). It explains the problem, the design decisions, and how to operate a multi-tenant deployment.
+
+---
+
+## Background
+
+Upstream Headscale assumes a single global tailnet. Every node, user, pre-auth key, IP address, ACL policy, and DNS domain is shared across the entire instance. This makes it unsuitable for SaaS or managed deployments where multiple customers need full isolation.
+
+The changes in this branch layer multi-tenancy on top of the existing codebase with a minimal footprint: a new `Tailnet` model becomes the isolation boundary, and a `tailnet_id` foreign key is threaded through the relevant tables.
+
+---
+
+## Architecture
+
+### The Isolation Boundary: `Tailnet`
+
+A `Tailnet` represents one customer's virtual network. It owns:
+
+| Resource | Scoped to Tailnet |
+|---|---|
+| Nodes | ✅ via `tailnet_id` FK |
+| Users | ✅ via `tailnet_id` FK |
+| Pre-auth keys | ✅ via `tailnet_id` FK |
+| IP address pool | ✅ per-tailnet `IPAllocator` |
+| Peer visibility | ✅ peer map built per-tailnet |
+| ACL policy | ✅ per-tailnet `PolicyManager` |
+| MagicDNS domain | ✅ per-tailnet `BaseDomain` |
+
+### Data Model
+
+```go
+type Tailnet struct {
+    gorm.Model
+    Name       string       // unique slug, e.g. "acme"
+    IPv4Prefix netip.Prefix // e.g. 100.64.0.0/16
+    IPv6Prefix netip.Prefix // e.g. fd7a:115c:a1e0::/48
+    BaseDomain string       // e.g. acme.ts.net
+    ACLPolicy  string       // HuJSON ACL stored in DB
+}
+```
+
+`Node`, `User`, and `PreAuthKey` each gain a `TailnetID *uint` foreign key. `nil` / `0` means the default (single-tenant) tailnet — fully backward compatible.
+
+### Isolation Layers (5 phases)
+
+#### Phase 1 — Schema
+
+- New `tailnets` table with prefix + domain + ACL fields
+- `tailnet_id` column added to `nodes`, `users`, `pre_auth_keys`
+- Migration `202604020000-multi-tenancy-tailnet` seeds a `default` tailnet and assigns all existing records to it
+- `schema.sql` updated as the squibble validation source of truth
+
+#### Phase 2 — Peer Map Scoping
+
+- `NodeStore.Snapshot` now indexes nodes by tailnet (`nodesByTailnet`)
+- The `PeersFunc` groups all nodes by tailnet before calling `BuildPeerMap` — nodes in different tailnets are **structurally prevented** from appearing in each other's peer maps, regardless of ACL
+- `State.ListPeers(nodeID, peerIDs...)` resolves candidates only within the requesting node's tailnet
+
+#### Phase 3 — Per-Tailnet IP Allocation
+
+- `TailnetIPAllocator` replaces the single global `IPAllocator`
+- On startup it loads all tailnets and creates a scoped `IPAllocator` for each, pre-loading only the IPs already used by nodes in that tailnet
+- `tailnetID=0` remains the default pool (backward compat)
+- New nodes get IPs from their tailnet's pool; deleted nodes return IPs to the same pool
+- `RegisterTailnet()` adds a pool at runtime when a new tailnet is created
+
+#### Phase 4 — Per-Tailnet Policy and DNS
+
+**ACL Policy:**
+- `State` holds a `perTailnetPolMan map[uint]PolicyManager`
+- Tailnets with a non-empty `ACLPolicy` get a dedicated `PolicyManager` initialised from their stored policy and scoped to their users/nodes
+- All node-context policy calls (`FilterForNode`, `MatchersForNode`, `SSHPolicy`, `NodeCanHaveTag`, `ViaRoutesForPeer`, route auto-approval) route through `getPolManForNode` → falls back to the global manager when no override exists
+- `RegisterTailnetPolicy(id, policy)` hot-reloads a tailnet's ACL without restart
+
+**DNS:**
+- `State.BaseDomainForNode(node)` returns the tailnet's `BaseDomain`, falling back to the global config value
+- The mapper's `cfgForNode(node)` creates a shallow `Config` copy with `BaseDomain` overridden — no allocation when the domain is unchanged
+- `TailNode()` (which generates FQDNs) receives the node-specific config, so `laptop.acme.ts.net` and `laptop.corp.ts.net` are produced correctly for nodes in different tailnets
+
+#### Phase 5 — Management API and CLI
+
+REST API at `/api/v1/tailnet` (protected by the existing API key middleware):
+
+| Method | Path | Action |
+|---|---|---|
+| `GET` | `/api/v1/tailnet` | List all tailnets |
+| `POST` | `/api/v1/tailnet` | Create a tailnet |
+| `GET` | `/api/v1/tailnet/{id}` | Get a tailnet |
+| `PUT` | `/api/v1/tailnet/{id}` | Update base domain / ACL |
+| `DELETE` | `/api/v1/tailnet/{id}` | Delete a tailnet |
+| `PUT` | `/api/v1/tailnet/{id}/policy` | Set ACL policy (hot-reload) |
+
+CLI subcommand `headscale tailnets` (calls the REST API using the configured `cli.address` + `cli.api_key`):
+
+```
+headscale tailnets list
+headscale tailnets create <name> [--ipv4-prefix] [--ipv6-prefix] [--base-domain] [--policy-file]
+headscale tailnets get <id>
+headscale tailnets update <id> [--base-domain] [--policy-file]
+headscale tailnets delete <id> [--force]
+headscale tailnets set-policy <id> --policy-file <path>
+```
+
+---
+
+## Operating a Multi-Tenant Deployment
+
+### 1. Start with the default tailnet
+
+On first run the migration seeds a `default` tailnet that absorbs all existing data. A single-tenant deployment works exactly as before — no config changes required.
+
+### 2. Create a tenant
+
+```bash
+# CLI
+headscale tailnets create acme \
+  --ipv4-prefix 100.64.0.0/16 \
+  --ipv6-prefix fd7a:115c:a1e0::/48 \
+  --base-domain acme.ts.net \
+  --policy-file /etc/headscale/policies/acme.hujson
+
+# REST
+curl -X POST https://headscale.example.com/api/v1/tailnet \
+  -H "Authorization: Bearer <apikey>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "acme",
+    "ipv4_prefix": "100.64.0.0/16",
+    "ipv6_prefix": "fd7a:115c:a1e0::/48",
+    "base_domain": "acme.ts.net",
+    "acl_policy": "{\"action\": \"accept\", ...}"
+  }'
+```
+
+### 3. Create users inside the tailnet
+
+At present, user creation uses the existing `headscale users create` command. The `tailnet_id` is assigned by setting it on the user record directly via the API or future CLI flag. This is a known gap — user creation with explicit tailnet assignment is the next increment.
+
+### 4. Create pre-auth keys for the tailnet
+
+Pre-auth keys inherit their tailnet from the owning user's `tailnet_id`. Nodes registered with a key inherit the same tailnet.
+
+### 5. Update a tailnet's ACL (hot-reload)
+
+```bash
+headscale tailnets set-policy 2 --policy-file /etc/headscale/policies/acme-v2.hujson
+```
+
+This persists the new policy to the DB and immediately reloads the in-memory `PolicyManager` and rebuilds peer maps — no restart required.
+
+### 6. Update the MagicDNS domain
+
+```bash
+headscale tailnets update 2 --base-domain new.acme.ts.net
+```
+
+Takes effect for the next MapResponse sent to each node.
+
+---
+
+## IP Prefix Planning
+
+Each tailnet needs its own non-overlapping prefix. The full CGNAT range is `100.64.0.0/10` (~4M addresses). Example split for up to 256 tenants:
+
+| Tailnet | IPv4 Prefix |
+|---|---|
+| default | `100.64.0.0/18` (16k addresses) |
+| tenant-1 | `100.64.64.0/18` |
+| tenant-2 | `100.64.128.0/18` |
+| ... | ... |
+
+IPv6: use per-tenant `/64` subnets under `fd7a:115c:a1e0::/48`.
+
+---
+
+## Design Decisions
+
+**Why a `tailnet_id` FK rather than separate DB schemas or separate Headscale instances?**
+
+Separate instances is operationally expensive and doesn't share the DERP map, noise key infrastructure, or binary. A FK column is the minimal change that achieves isolation — easy to add, easy to query, easy to migrate.
+
+**Why keep a global `polMan` fallback?**
+
+Tailnets without a stored ACL policy should still work. The global policy (from file or DB) acts as the default, exactly like single-tenant mode. Per-tailnet overrides are opt-in.
+
+**Why a plain HTTP REST API instead of extending the gRPC proto?**
+
+Extending the proto requires regenerating the gRPC-gateway bindings with `buf`, which adds toolchain complexity. The chi router already handles non-gRPC routes. The REST API uses the same auth middleware and is functionally equivalent. Proto definitions can be added in a follow-up once the API surface stabilises.
+
+---
+
+## Known Gaps and Next Steps
+
+| Area | Status | Notes |
+|---|---|---|
+| User creation with `--tailnet` flag | 🔲 | Currently requires direct DB or API |
+| Pre-auth key scoping via CLI | 🔲 | Key inherits from user for now |
+| Tailnet listing in `headscale nodes list` | 🔲 | Should filter by tailnet |
+| Per-tailnet DERP map | 🔲 | Currently shared globally |
+| Tailnet usage metrics | 🔲 | Prometheus labels per tailnet |
+| Integration tests | 🔲 | Node isolation assertions |
+
+---
+
+## Linear
+
+Tracked under **TRE-42** in the Trescale workspace.
