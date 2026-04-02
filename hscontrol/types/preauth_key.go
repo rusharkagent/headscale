@@ -42,6 +42,11 @@ type PreAuthKey struct {
 
 	CreatedAt  *time.Time
 	Expiration *time.Time
+
+	// TailnetID is the tailnet this preauth key belongs to.
+	// Nil means the key belongs to the default (single-tenant) tailnet.
+	TailnetID *uint
+	Tailnet   *Tailnet `gorm:"constraint:OnDelete:CASCADE;"`
 }
 
 // PreAuthKeyNew is returned once when the key is created.

@@ -36,6 +36,8 @@ var _UserCloneNeedsRegeneration = User(struct {
 	ProviderIdentifier sql.NullString
 	Provider           string
 	ProfilePicURL      string
+	TailnetID          *uint
+	Tailnet            *Tailnet
 }{})
 
 // Clone makes a deep copy of Node.
@@ -106,6 +108,8 @@ var _NodeCloneNeedsRegeneration = Node(struct {
 	UpdatedAt      time.Time
 	DeletedAt      *time.Time
 	IsOnline       *bool
+	TailnetID      *uint
+	Tailnet        *Tailnet
 }{})
 
 // Clone makes a deep copy of PreAuthKey.
@@ -147,4 +151,6 @@ var _PreAuthKeyCloneNeedsRegeneration = PreAuthKey(struct {
 	Tags       []string
 	CreatedAt  *time.Time
 	Expiration *time.Time
+	TailnetID  *uint
+	Tailnet    *Tailnet
 }{})

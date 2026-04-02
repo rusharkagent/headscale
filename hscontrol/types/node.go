@@ -150,6 +150,11 @@ type Node struct {
 	DeletedAt *time.Time
 
 	IsOnline *bool `gorm:"-"`
+
+	// TailnetID is the tailnet this node belongs to.
+	// Nil means the node belongs to the default (single-tenant) tailnet.
+	TailnetID *uint
+	Tailnet   *Tailnet `gorm:"constraint:OnDelete:CASCADE;"`
 }
 
 type Nodes []*Node

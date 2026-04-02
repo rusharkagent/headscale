@@ -124,6 +124,8 @@ var _UserViewNeedsRegeneration = User(struct {
 	ProviderIdentifier sql.NullString
 	Provider           string
 	ProfilePicURL      string
+	TailnetID          *uint
+	Tailnet            *Tailnet
 }{})
 
 // View returns a read-only view of Node.
@@ -285,6 +287,8 @@ var _NodeViewNeedsRegeneration = Node(struct {
 	UpdatedAt      time.Time
 	DeletedAt      *time.Time
 	IsOnline       *bool
+	TailnetID      *uint
+	Tailnet        *Tailnet
 }{})
 
 // View returns a read-only view of PreAuthKey.
@@ -401,4 +405,6 @@ var _PreAuthKeyViewNeedsRegeneration = PreAuthKey(struct {
 	Tags       []string
 	CreatedAt  *time.Time
 	Expiration *time.Time
+	TailnetID  *uint
+	Tailnet    *Tailnet
 }{})

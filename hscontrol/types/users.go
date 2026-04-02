@@ -92,6 +92,11 @@ type User struct {
 	Provider string
 
 	ProfilePicURL string
+
+	// TailnetID is the tailnet this user belongs to.
+	// Nil means the user belongs to the default (single-tenant) tailnet.
+	TailnetID *uint
+	Tailnet   *Tailnet `gorm:"constraint:OnDelete:CASCADE;"`
 }
 
 func (u *User) StringID() string {

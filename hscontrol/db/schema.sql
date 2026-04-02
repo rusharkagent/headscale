@@ -4,6 +4,22 @@
 
 CREATE TABLE migrations(id text,PRIMARY KEY(id));
 
+-- Multi-tenancy: each tailnet is an isolated virtual network.
+CREATE TABLE tailnets(
+  id integer PRIMARY KEY AUTOINCREMENT,
+  name text UNIQUE NOT NULL,
+  ipv4_prefix text,
+  ipv6_prefix text,
+  base_domain text,
+  acl_policy text,
+
+  created_at datetime,
+  updated_at datetime,
+  deleted_at datetime
+);
+CREATE INDEX idx_tailnets_deleted_at ON tailnets(deleted_at);
+CREATE UNIQUE INDEX idx_tailnets_name ON tailnets(name);
+
 CREATE TABLE users(
   id integer PRIMARY KEY AUTOINCREMENT,
   name text,
@@ -12,10 +28,13 @@ CREATE TABLE users(
   provider_identifier text,
   provider text,
   profile_pic_url text,
+  tailnet_id integer,
 
   created_at datetime,
   updated_at datetime,
-  deleted_at datetime
+  deleted_at datetime,
+
+  CONSTRAINT fk_users_tailnet FOREIGN KEY(tailnet_id) REFERENCES tailnets(id) ON DELETE CASCADE
 );
 CREATE INDEX idx_users_deleted_at ON users(deleted_at);
 
@@ -49,10 +68,12 @@ CREATE TABLE pre_auth_keys(
   used numeric DEFAULT false,
   tags text,
   expiration datetime,
+  tailnet_id integer,
 
   created_at datetime,
 
-  CONSTRAINT fk_pre_auth_keys_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
+  CONSTRAINT fk_pre_auth_keys_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL,
+  CONSTRAINT fk_pre_auth_keys_tailnet FOREIGN KEY(tailnet_id) REFERENCES tailnets(id) ON DELETE CASCADE
 );
 CREATE UNIQUE INDEX idx_pre_auth_keys_prefix ON pre_auth_keys(prefix) WHERE prefix IS NOT NULL AND prefix != '';
 
@@ -88,13 +109,15 @@ CREATE TABLE nodes(
   last_seen datetime,
   expiry datetime,
   approved_routes text,
+  tailnet_id integer,
 
   created_at datetime,
   updated_at datetime,
   deleted_at datetime,
 
   CONSTRAINT fk_nodes_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
-  CONSTRAINT fk_nodes_auth_key FOREIGN KEY(auth_key_id) REFERENCES pre_auth_keys(id)
+  CONSTRAINT fk_nodes_auth_key FOREIGN KEY(auth_key_id) REFERENCES pre_auth_keys(id),
+  CONSTRAINT fk_nodes_tailnet FOREIGN KEY(tailnet_id) REFERENCES tailnets(id) ON DELETE CASCADE
 );
 
 CREATE TABLE policies(
