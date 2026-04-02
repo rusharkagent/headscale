@@ -368,3 +368,287 @@ func (i *IPAllocator) FreeIPs(ips []netip.Addr) {
 		i.usedIPs.Remove(ip)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// TailnetIPAllocator — per-tailnet IP allocation
+// ---------------------------------------------------------------------------
+
+// TailnetIPAllocator manages a separate IPAllocator per tailnet.
+// This ensures that nodes in different tailnets get IPs from their own
+// dedicated prefix and can never accidentally share or conflict on addresses.
+//
+// tailnetID=0 is the "default" tailnet — used for nodes with a NULL tailnet_id
+// and for backward compatibility with single-tenant deployments.
+type TailnetIPAllocator struct {
+	mu         sync.RWMutex
+	allocators map[uint]*IPAllocator // tailnetID → allocator (0 = default)
+	strategy   types.IPAllocationStrategy
+}
+
+// NewTailnetIPAllocator builds a TailnetIPAllocator by:
+//  1. Creating a default allocator for tailnetID=0 using cfg.PrefixV4/V6
+//     (backward compat — nodes without a tailnet_id use this pool).
+//  2. Loading all tailnets from the DB and creating a scoped allocator for each.
+func NewTailnetIPAllocator(
+	db *HSDatabase,
+	defaultPrefix4, defaultPrefix6 *netip.Prefix,
+	strategy types.IPAllocationStrategy,
+) (*TailnetIPAllocator, error) {
+	ta := &TailnetIPAllocator{
+		allocators: make(map[uint]*IPAllocator),
+		strategy:   strategy,
+	}
+
+	// Default tailnet (id=0): uses the global config prefix.
+	// This is the backward-compat path for existing single-tenant deployments.
+	defaultAlloc, err := newIPAllocatorForTailnet(db, 0, defaultPrefix4, defaultPrefix6, strategy)
+	if err != nil {
+		return nil, fmt.Errorf("creating default IP allocator: %w", err)
+	}
+
+	ta.allocators[0] = defaultAlloc
+
+	// Per-tailnet allocators from the DB.
+	if db != nil {
+		tailnets, err := db.ListTailnets()
+		if err != nil {
+			return nil, fmt.Errorf("loading tailnets for IP allocator: %w", err)
+		}
+
+		for _, tn := range tailnets {
+			if !tn.IPv4Prefix.IsValid() && !tn.IPv6Prefix.IsValid() {
+				// Tailnet has no prefix yet — skip (will use default).
+				continue
+			}
+
+			var p4, p6 *netip.Prefix
+			if tn.IPv4Prefix.IsValid() {
+				p := tn.IPv4Prefix
+				p4 = &p
+			}
+
+			if tn.IPv6Prefix.IsValid() {
+				p := tn.IPv6Prefix
+				p6 = &p
+			}
+
+			alloc, err := newIPAllocatorForTailnet(db, tn.ID, p4, p6, strategy)
+			if err != nil {
+				return nil, fmt.Errorf("creating IP allocator for tailnet %d (%q): %w", tn.ID, tn.Name, err)
+			}
+
+			ta.allocators[tn.ID] = alloc
+		}
+	}
+
+	return ta, nil
+}
+
+// newIPAllocatorForTailnet creates an IPAllocator scoped to a specific tailnet,
+// pre-loading only the IPs already used by nodes in that tailnet.
+func newIPAllocatorForTailnet(
+	db *HSDatabase,
+	tailnetID uint,
+	prefix4, prefix6 *netip.Prefix,
+	strategy types.IPAllocationStrategy,
+) (*IPAllocator, error) {
+	alloc := &IPAllocator{
+		prefix4:  prefix4,
+		prefix6:  prefix6,
+		strategy: strategy,
+	}
+
+	var ips netipx.IPSetBuilder
+
+	if prefix4 != nil {
+		network4, broadcast4 := util.GetIPPrefixEndpoints(*prefix4)
+		ips.Add(network4)
+		ips.Add(broadcast4)
+		alloc.prev4 = network4
+	}
+
+	if prefix6 != nil {
+		network6, broadcast6 := util.GetIPPrefixEndpoints(*prefix6)
+		ips.Add(network6)
+		ips.Add(broadcast6)
+		alloc.prev6 = network6
+	}
+
+	// Load used IPs from DB, scoped to this tailnet.
+	if db != nil {
+		var v4s, v6s []sql.NullString
+
+		err := db.Read(func(rx *gorm.DB) error {
+			q := rx.Model(&types.Node{})
+			if tailnetID == 0 {
+				q = q.Where("tailnet_id IS NULL OR tailnet_id = 0")
+			} else {
+				q = q.Where("tailnet_id = ?", tailnetID)
+			}
+
+			if err := q.Pluck("ipv4", &v4s).Error; err != nil {
+				return err
+			}
+
+			q2 := rx.Model(&types.Node{})
+			if tailnetID == 0 {
+				q2 = q2.Where("tailnet_id IS NULL OR tailnet_id = 0")
+			} else {
+				q2 = q2.Where("tailnet_id = ?", tailnetID)
+			}
+
+			return q2.Pluck("ipv6", &v6s).Error
+		})
+		if err != nil {
+			return nil, fmt.Errorf("reading used IPs for tailnet %d: %w", tailnetID, err)
+		}
+
+		for _, addrStr := range append(v4s, v6s...) {
+			if addrStr.Valid {
+				addr, err := netip.ParseAddr(addrStr.String)
+				if err != nil {
+					return nil, fmt.Errorf("parsing IP for tailnet %d: %w", tailnetID, err)
+				}
+
+				ips.Add(addr)
+			}
+		}
+	}
+
+	if _, err := ips.IPSet(); err != nil {
+		return nil, fmt.Errorf("building IP set for tailnet %d: %w", tailnetID, err)
+	}
+
+	alloc.usedIPs = ips
+
+	return alloc, nil
+}
+
+// Next allocates the next available IPv4/IPv6 pair for the given tailnet.
+// Falls back to tailnetID=0 if no dedicated allocator exists.
+func (ta *TailnetIPAllocator) Next(tailnetID uint) (*netip.Addr, *netip.Addr, error) {
+	ta.mu.RLock()
+	alloc, ok := ta.allocators[tailnetID]
+	ta.mu.RUnlock()
+
+	if !ok {
+		// Fall back to default allocator for unknown tailnets.
+		ta.mu.RLock()
+		alloc = ta.allocators[0]
+		ta.mu.RUnlock()
+	}
+
+	return alloc.Next()
+}
+
+// FreeIPs releases the given IPs back to the tailnet's pool.
+func (ta *TailnetIPAllocator) FreeIPs(tailnetID uint, ips []netip.Addr) {
+	ta.mu.RLock()
+	alloc, ok := ta.allocators[tailnetID]
+	ta.mu.RUnlock()
+
+	if !ok {
+		ta.mu.RLock()
+		alloc = ta.allocators[0]
+		ta.mu.RUnlock()
+	}
+
+	alloc.FreeIPs(ips)
+}
+
+// RegisterTailnet adds (or replaces) the allocator for a new tailnet.
+// Called when a new tailnet is created at runtime.
+func (ta *TailnetIPAllocator) RegisterTailnet(
+	db *HSDatabase,
+	tailnetID uint,
+	prefix4, prefix6 *netip.Prefix,
+) error {
+	alloc, err := newIPAllocatorForTailnet(db, tailnetID, prefix4, prefix6, ta.strategy)
+	if err != nil {
+		return err
+	}
+
+	ta.mu.Lock()
+	ta.allocators[tailnetID] = alloc
+	ta.mu.Unlock()
+
+	return nil
+}
+
+// BackfillNodeIPsMultiTenant assigns IPs to nodes that are missing them,
+// using each node's tailnet allocator.
+func (db *HSDatabase) BackfillNodeIPsMultiTenant(ta *TailnetIPAllocator) ([]string, error) {
+	var ret []string
+
+	err := db.Write(func(tx *gorm.DB) error {
+		if ta == nil {
+			return fmt.Errorf("backfilling IPs: allocator is nil")
+		}
+
+		nodes, err := ListNodes(tx)
+		if err != nil {
+			return fmt.Errorf("listing nodes to backfill IPs: %w", err)
+		}
+
+		for _, node := range nodes {
+			tailnetID := uint(0)
+			if node.TailnetID != nil {
+				tailnetID = *node.TailnetID
+			}
+
+			ta.mu.RLock()
+			alloc, ok := ta.allocators[tailnetID]
+			if !ok {
+				alloc = ta.allocators[0]
+			}
+			ta.mu.RUnlock()
+
+			changed := false
+
+			if alloc.prefix4 != nil && node.IPv4 == nil {
+				ret4, err := alloc.nextLocked(alloc.prev4, alloc.prefix4)
+				if err != nil {
+					return fmt.Errorf("allocating IPv4 for node(%d) in tailnet(%d): %w", node.ID, tailnetID, err)
+				}
+
+				node.IPv4 = ret4
+				changed = true
+				ret = append(ret, fmt.Sprintf("assigned IPv4 %q to Node(%d) %q (tailnet %d)", ret4, node.ID, node.Hostname, tailnetID))
+			}
+
+			if alloc.prefix6 != nil && node.IPv6 == nil {
+				ret6, err := alloc.nextLocked(alloc.prev6, alloc.prefix6)
+				if err != nil {
+					return fmt.Errorf("allocating IPv6 for node(%d) in tailnet(%d): %w", node.ID, tailnetID, err)
+				}
+
+				node.IPv6 = ret6
+				changed = true
+				ret = append(ret, fmt.Sprintf("assigned IPv6 %q to Node(%d) %q (tailnet %d)", ret6, node.ID, node.Hostname, tailnetID))
+			}
+
+			if alloc.prefix4 == nil && node.IPv4 != nil {
+				ret = append(ret, fmt.Sprintf("removing IPv4 %q from Node(%d) %q (tailnet %d)", node.IPv4, node.ID, node.Hostname, tailnetID))
+				node.IPv4 = nil
+				changed = true
+			}
+
+			if alloc.prefix6 == nil && node.IPv6 != nil {
+				ret = append(ret, fmt.Sprintf("removing IPv6 %q from Node(%d) %q (tailnet %d)", node.IPv6, node.ID, node.Hostname, tailnetID))
+				node.IPv6 = nil
+				changed = true
+			}
+
+			if changed {
+				err := tx.Model(node).Select("ipv4", "ipv6").Updates(node).Error
+				if err != nil {
+					return fmt.Errorf("saving node(%d) after IP backfill: %w", node.ID, err)
+				}
+			}
+		}
+
+		return nil
+	})
+
+	return ret, err
+}

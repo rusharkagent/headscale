@@ -86,8 +86,8 @@ type State struct {
 	// subsystem keeping state
 	// db provides persistent storage and database operations
 	db *hsdb.HSDatabase
-	// ipAlloc manages IP address allocation for nodes
-	ipAlloc *hsdb.IPAllocator
+	// ipAlloc manages per-tailnet IP address allocation for nodes
+	ipAlloc *hsdb.TailnetIPAllocator
 	// derpMap contains the current DERP relay configuration
 	derpMap atomic.Pointer[tailcfg.DERPMap]
 	// polMan handles policy evaluation and management
@@ -157,7 +157,7 @@ func NewState(cfg *types.Config) (*State, error) {
 		return nil, fmt.Errorf("initializing database: %w", err)
 	}
 
-	ipAlloc, err := hsdb.NewIPAllocator(db, cfg.PrefixV4, cfg.PrefixV6, cfg.IPAllocation)
+	ipAlloc, err := hsdb.NewTailnetIPAllocator(db, cfg.PrefixV4, cfg.PrefixV6, cfg.IPAllocation)
 	if err != nil {
 		return nil, fmt.Errorf("initializing IP allocator: %w", err)
 	}
@@ -519,7 +519,12 @@ func (s *State) DeleteNode(node types.NodeView) (change.Change, error) {
 		return change.Change{}, err
 	}
 
-	s.ipAlloc.FreeIPs(node.IPs())
+	tailnetID := uint(0)
+	if v, ok := node.TailnetID().GetOk(); ok {
+		tailnetID = v
+	}
+
+	s.ipAlloc.FreeIPs(tailnetID, node.IPs())
 
 	c := change.NodeRemoved(node.ID())
 
@@ -947,7 +952,7 @@ func (s *State) RenameNode(nodeID types.NodeID, newName string) (types.NodeView,
 
 // BackfillNodeIPs assigns IP addresses to nodes that don't have them.
 func (s *State) BackfillNodeIPs() ([]string, error) {
-	changes, err := s.db.BackfillNodeIPs(s.ipAlloc)
+	changes, err := s.db.BackfillNodeIPsMultiTenant(s.ipAlloc)
 	if err != nil {
 		return nil, err
 	}
@@ -1352,6 +1357,11 @@ type newNodeParams struct {
 
 	// Optional: Existing node for netinfo preservation
 	ExistingNodeForNetinfo types.NodeView
+
+	// TailnetID is the tailnet this node should be registered into.
+	// 0 = default tailnet (backward compat / single-tenant).
+	// Derived from PreAuthKey.TailnetID or User.TailnetID at call sites.
+	TailnetID uint
 }
 
 // authNodeUpdateParams contains parameters for updating an existing node during auth.
@@ -1608,8 +1618,13 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 		return types.NodeView{}, err
 	}
 
-	// Allocate new IPs
-	ipv4, ipv6, err := s.ipAlloc.Next()
+	// Assign tailnet before IP allocation so the correct per-tailnet pool is used.
+	if params.TailnetID != 0 {
+		nodeToRegister.TailnetID = &params.TailnetID
+	}
+
+	// Allocate new IPs from this node's tailnet pool.
+	ipv4, ipv6, err := s.ipAlloc.Next(params.TailnetID)
 	if err != nil {
 		return types.NodeView{}, fmt.Errorf("allocating IPs: %w", err)
 	}
@@ -1920,6 +1935,12 @@ func (s *State) createNewNodeFromAuth(
 		Interface("expiry", expiry).
 		Msg("Registering new node from auth callback")
 
+	// Derive tailnet from the user.
+	userTailnetID := uint(0)
+	if user.TailnetID != nil {
+		userTailnetID = *user.TailnetID
+	}
+
 	return s.createAndSaveNewNode(newNodeParams{
 		User:                   *user,
 		MachineKey:             regEntry.Node().MachineKey(),
@@ -1931,6 +1952,7 @@ func (s *State) createNewNodeFromAuth(
 		Expiry:                 cmp.Or(expiry, regEntry.Node().Expiry().Clone()),
 		RegisterMethod:         registrationMethod,
 		ExistingNodeForNetinfo: existingNodeForNetinfo,
+		TailnetID:              userTailnetID,
 	})
 }
 
@@ -2163,6 +2185,14 @@ func (s *State) HandleNodeFromPreAuthKey(
 
 		var err error
 
+		// Derive tailnet from the PreAuthKey, falling back to the key's owner user.
+		pakTailnetID := uint(0)
+		if pak.TailnetID != nil {
+			pakTailnetID = *pak.TailnetID
+		} else if pak.User != nil && pak.User.TailnetID != nil {
+			pakTailnetID = *pak.User.TailnetID
+		}
+
 		finalNode, err = s.createAndSaveNewNode(newNodeParams{
 			User:                   pakUser,
 			MachineKey:             machineKey,
@@ -2175,6 +2205,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 			RegisterMethod:         util.RegisterMethodAuthKey,
 			PreAuthKey:             pak,
 			ExistingNodeForNetinfo: cmp.Or(existingNodeAnyUser, types.NodeView{}),
+			TailnetID:              pakTailnetID,
 		})
 		if err != nil {
 			return types.NodeView{}, change.Change{}, fmt.Errorf("creating new node: %w", err)
