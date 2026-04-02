@@ -1106,24 +1106,46 @@ func (s *State) getPolManForNode(node types.NodeView) policy.PolicyManager {
 }
 
 // BaseDomainForNode returns the MagicDNS base domain for the given node's tailnet.
-// Falls back to the global config BaseDomain when the tailnet has no override.
+//
+// Resolution order:
+//  1. If the tailnet has an explicit BaseDomain set → use it (operator override).
+//  2. If the tailnet has a Name that isn't "default" → derive as "<name>.<globalBaseDomain>".
+//     This means a single global dns.base_domain (e.g. "ts.example.com") automatically
+//     namespaces each tenant: acme nodes get "acme.ts.example.com", corp gets "corp.ts.example.com".
+//     Auth (pre-auth key / OIDC) is the only thing that determines which tailnet a node joins.
+//  3. Default tailnet or no tailnet → global config BaseDomain as-is.
 func (s *State) BaseDomainForNode(node types.NodeView) string {
+	globalDomain := s.cfg.DNSConfig.BaseDomain
+
 	tailnetID := uint(0)
 	if v, ok := node.TailnetID().GetOk(); ok {
 		tailnetID = v
 	}
 
-	if tailnetID != 0 {
-		s.tailnetCacheMu.RLock()
-		tn, ok := s.tailnetCache[tailnetID]
-		s.tailnetCacheMu.RUnlock()
-
-		if ok && tn.BaseDomain != "" {
-			return tn.BaseDomain
-		}
+	if tailnetID == 0 {
+		return globalDomain
 	}
 
-	return s.cfg.DNSConfig.BaseDomain
+	s.tailnetCacheMu.RLock()
+	tn, ok := s.tailnetCache[tailnetID]
+	s.tailnetCacheMu.RUnlock()
+
+	if !ok {
+		return globalDomain
+	}
+
+	// Explicit override wins.
+	if tn.BaseDomain != "" {
+		return tn.BaseDomain
+	}
+
+	// Auto-derive from tailnet name + global domain — no per-tenant config needed.
+	// "default" tailnet uses the global domain as-is (single-tenant compat).
+	if tn.Name != "" && tn.Name != "default" && globalDomain != "" {
+		return tn.Name + "." + globalDomain
+	}
+
+	return globalDomain
 }
 
 // RegisterTailnetPolicy registers or updates the per-tailnet policy manager.

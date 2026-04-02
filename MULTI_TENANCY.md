@@ -75,9 +75,13 @@ type Tailnet struct {
 - `RegisterTailnetPolicy(id, policy)` hot-reloads a tailnet's ACL without restart
 
 **DNS:**
-- `State.BaseDomainForNode(node)` returns the tailnet's `BaseDomain`, falling back to the global config value
+- `State.BaseDomainForNode(node)` resolves the effective MagicDNS domain for a node using this priority order:
+  1. Explicit `Tailnet.BaseDomain` override (operator-set)
+  2. Auto-derived: `<tailnet-name>.<global-base-domain>` — single config, automatic namespacing per tenant
+  3. Global `dns.base_domain` (default tailnet / single-tenant compat)
+- This means **no per-tenant DNS config is needed**. Set `dns.base_domain = ts.example.com` once; nodes in tailnet `acme` automatically get FQDNs like `laptop.acme.ts.example.com`. Auth determines the tailnet; the tailnet determines the subdomain.
 - The mapper's `cfgForNode(node)` creates a shallow `Config` copy with `BaseDomain` overridden — no allocation when the domain is unchanged
-- `TailNode()` (which generates FQDNs) receives the node-specific config, so `laptop.acme.ts.net` and `laptop.corp.ts.net` are produced correctly for nodes in different tailnets
+- `TailNode()` (which generates FQDNs) receives the node-specific config, producing correct per-tenant domains
 
 #### Phase 5 — Management API and CLI
 
@@ -111,15 +115,34 @@ headscale tailnets set-policy <id> --policy-file <path>
 
 On first run the migration seeds a `default` tailnet that absorbs all existing data. A single-tenant deployment works exactly as before — no config changes required.
 
-### 2. Create a tenant
+### 2. Configure a single base domain (one-time, in headscale config)
+
+```yaml
+# config.yaml
+dns:
+  base_domain: ts.example.com   # all tenants share this — no per-tenant DNS config needed
+```
+
+Node FQDNs are auto-namespaced from the tailnet name:
+- Tailnet `acme` → `laptop.acme.ts.example.com`
+- Tailnet `corp` → `laptop.corp.ts.example.com`
+- Default tailnet → `laptop.ts.example.com`
+
+Auth (pre-auth key or OIDC) determines which tailnet a node joins. The tailnet determines the subdomain prefix. You don't configure DNS per tenant.
+
+### 3. Create a tenant
 
 ```bash
-# CLI
+# CLI — no --base-domain needed, derived automatically from tailnet name
 headscale tailnets create acme \
   --ipv4-prefix 100.64.0.0/16 \
   --ipv6-prefix fd7a:115c:a1e0::/48 \
-  --base-domain acme.ts.net \
   --policy-file /etc/headscale/policies/acme.hujson
+
+# To override the domain explicitly (optional):
+headscale tailnets create acme \
+  --ipv4-prefix 100.64.0.0/16 \
+  --base-domain custom.acme.net   # overrides the auto-derived domain
 
 # REST
 curl -X POST https://headscale.example.com/api/v1/tailnet \
@@ -129,7 +152,6 @@ curl -X POST https://headscale.example.com/api/v1/tailnet \
     "name": "acme",
     "ipv4_prefix": "100.64.0.0/16",
     "ipv6_prefix": "fd7a:115c:a1e0::/48",
-    "base_domain": "acme.ts.net",
     "acl_policy": "{\"action\": \"accept\", ...}"
   }'
 ```
