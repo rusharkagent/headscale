@@ -152,7 +152,7 @@ type Node struct {
 	IsOnline *bool `gorm:"-"`
 
 	// TailnetID is the tailnet this node belongs to.
-	// Nil means the node belongs to the default (single-tenant) tailnet.
+	// Must be set — every node must belong to an explicit tailnet.
 	TailnetID *uint
 	Tailnet   *Tailnet `gorm:"constraint:OnDelete:CASCADE;"`
 }

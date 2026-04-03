@@ -444,13 +444,12 @@ func snapshotFromNodes(nodes map[types.NodeID]types.Node, peersFunc PeersFunc) S
 
 		newSnap.nodesByMachineKey[n.MachineKey][userID] = nodeView
 
-		// Build tailnet index: TailnetID nil → key 0 (default tailnet)
-		tid := uint(0)
+		// Build tailnet index. Nodes without a tailnet_id are skipped —
+		// every node must belong to an explicit tailnet.
 		if n.TailnetID != nil {
-			tid = *n.TailnetID
+			tid := *n.TailnetID
+			newSnap.nodesByTailnet[tid] = append(newSnap.nodesByTailnet[tid], nodeView)
 		}
-
-		newSnap.nodesByTailnet[tid] = append(newSnap.nodesByTailnet[tid], nodeView)
 	}
 
 	return newSnap

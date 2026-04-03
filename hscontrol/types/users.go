@@ -94,7 +94,7 @@ type User struct {
 	ProfilePicURL string
 
 	// TailnetID is the tailnet this user belongs to.
-	// Nil means the user belongs to the default (single-tenant) tailnet.
+	// Must be set — every user must belong to an explicit tailnet.
 	TailnetID *uint
 	Tailnet   *Tailnet `gorm:"constraint:OnDelete:CASCADE;"`
 }

@@ -41,7 +41,7 @@ type Tailnet struct {
 }
 ```
 
-`Node`, `User`, and `PreAuthKey` each gain a `TailnetID *uint` foreign key. `nil` / `0` means the default (single-tenant) tailnet — fully backward compatible.
+`Node`, `User`, and `PreAuthKey` each have a `TailnetID *uint` foreign key. **This field must always be set** — there is no default or fallback tailnet. Every resource must belong to an explicit `Tailnet`.
 
 ### Isolation Layers (5 phases)
 
@@ -49,7 +49,7 @@ type Tailnet struct {
 
 - New `tailnets` table with prefix + domain + ACL fields
 - `tailnet_id` column added to `nodes`, `users`, `pre_auth_keys`
-- Migration `202604020000-multi-tenancy-tailnet` seeds a `default` tailnet and assigns all existing records to it
+- Migration `202604020000-multi-tenancy-tailnet` adds the FK columns — no default tailnet is seeded; every record must be assigned to an explicit tailnet at creation time
 - `schema.sql` updated as the squibble validation source of truth
 
 #### Phase 2 — Peer Map Scoping
@@ -62,8 +62,8 @@ type Tailnet struct {
 
 - `TailnetIPAllocator` replaces the single global `IPAllocator`
 - On startup it loads all tailnets and creates a scoped `IPAllocator` for each, pre-loading only the IPs already used by nodes in that tailnet
-- `tailnetID=0` remains the default pool (backward compat)
 - New nodes get IPs from their tailnet's pool; deleted nodes return IPs to the same pool
+- Allocating IPs for an unknown tailnet returns an error — there is no fallback pool
 - `RegisterTailnet()` adds a pool at runtime when a new tailnet is created
 
 #### Phase 4 — Per-Tailnet Policy and DNS
@@ -78,7 +78,7 @@ type Tailnet struct {
 - `State.BaseDomainForNode(node)` resolves the effective MagicDNS domain for a node using this priority order:
   1. Explicit `Tailnet.BaseDomain` override (operator-set)
   2. Auto-derived: `<tailnet-name>.<global-base-domain>` — single config, automatic namespacing per tenant
-  3. Global `dns.base_domain` (default tailnet / single-tenant compat)
+  3. Global `dns.base_domain` as fallback (e.g. if tailnet has no name)
 - This means **no per-tenant DNS config is needed**. Set `dns.base_domain = ts.example.com` once; nodes in tailnet `acme` automatically get FQDNs like `laptop.acme.ts.example.com`. Auth determines the tailnet; the tailnet determines the subdomain.
 - The mapper's `cfgForNode(node)` creates a shallow `Config` copy with `BaseDomain` overridden — no allocation when the domain is unchanged
 - `TailNode()` (which generates FQDNs) receives the node-specific config, producing correct per-tenant domains
@@ -111,11 +111,9 @@ headscale tailnets set-policy <id> --policy-file <path>
 
 ## Operating a Multi-Tenant Deployment
 
-### 1. Start with the default tailnet
+> **Note:** There is no default tailnet. Every node, user, and pre-auth key must belong to an explicit tenant created via the API or CLI. Single-tenant mode is not supported — create a named tailnet for your single customer if needed.
 
-On first run the migration seeds a `default` tailnet that absorbs all existing data. A single-tenant deployment works exactly as before — no config changes required.
-
-### 2. Configure a single base domain (one-time, in headscale config)
+### 1. Configure a single base domain (one-time, in headscale config)
 
 ```yaml
 # config.yaml
@@ -126,11 +124,10 @@ dns:
 Node FQDNs are auto-namespaced from the tailnet name:
 - Tailnet `acme` → `laptop.acme.ts.example.com`
 - Tailnet `corp` → `laptop.corp.ts.example.com`
-- Default tailnet → `laptop.ts.example.com`
 
 Auth (pre-auth key or OIDC) determines which tailnet a node joins. The tailnet determines the subdomain prefix. You don't configure DNS per tenant.
 
-### 3. Create a tenant
+### 2. Create a tenant
 
 ```bash
 # CLI — no --base-domain needed, derived automatically from tailnet name
@@ -156,7 +153,7 @@ curl -X POST https://headscale.example.com/api/v1/tailnet \
   }'
 ```
 
-### 3. Create users inside the tailnet
+### 3. Create users inside the tailnet  
 
 At present, user creation uses the existing `headscale users create` command. The `tailnet_id` is assigned by setting it on the user record directly via the API or future CLI flag. This is a known gap — user creation with explicit tailnet assignment is the next increment.
 
@@ -188,9 +185,9 @@ Each tailnet needs its own non-overlapping prefix. The full CGNAT range is `100.
 
 | Tailnet | IPv4 Prefix |
 |---|---|
-| default | `100.64.0.0/18` (16k addresses) |
-| tenant-1 | `100.64.64.0/18` |
-| tenant-2 | `100.64.128.0/18` |
+| tenant-1 | `100.64.0.0/18` (16k addresses) |
+| tenant-2 | `100.64.64.0/18` |
+| tenant-3 | `100.64.128.0/18` |
 | ... | ... |
 
 IPv6: use per-tenant `/64` subnets under `fd7a:115c:a1e0::/48`.
@@ -203,9 +200,9 @@ IPv6: use per-tenant `/64` subnets under `fd7a:115c:a1e0::/48`.
 
 Separate instances is operationally expensive and doesn't share the DERP map, noise key infrastructure, or binary. A FK column is the minimal change that achieves isolation — easy to add, easy to query, easy to migrate.
 
-**Why keep a global `polMan` fallback?**
+**Why keep a global `polMan` at all?**
 
-Tailnets without a stored ACL policy should still work. The global policy (from file or DB) acts as the default, exactly like single-tenant mode. Per-tailnet overrides are opt-in.
+Tailnets without a stored ACL policy fall back to the global policy manager (loaded from file or DB). This acts as a shared baseline — useful for applying a common "deny all" or "allow same-tailnet" rule without duplicating it per tenant. Per-tailnet policy managers are opt-in overrides.
 
 **Why a plain HTTP REST API instead of extending the gRPC proto?**
 

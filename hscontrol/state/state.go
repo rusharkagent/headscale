@@ -167,7 +167,7 @@ func NewState(cfg *types.Config) (*State, error) {
 		return nil, fmt.Errorf("initializing database: %w", err)
 	}
 
-	ipAlloc, err := hsdb.NewTailnetIPAllocator(db, cfg.PrefixV4, cfg.PrefixV6, cfg.IPAllocation)
+	ipAlloc, err := hsdb.NewTailnetIPAllocator(db, cfg.IPAllocation)
 	if err != nil {
 		return nil, fmt.Errorf("initializing IP allocator: %w", err)
 	}
@@ -1082,14 +1082,12 @@ func (s *State) ExpireExpiredNodes(lastCheck time.Time) (time.Time, []change.Cha
 // getPolManForTailnet returns the PolicyManager for the given tailnet.
 // Falls back to the global polMan when no per-tailnet override exists.
 func (s *State) getPolManForTailnet(tailnetID uint) policy.PolicyManager {
-	if tailnetID != 0 {
-		s.perTailnetPolManMu.RLock()
-		pm, ok := s.perTailnetPolMan[tailnetID]
-		s.perTailnetPolManMu.RUnlock()
+	s.perTailnetPolManMu.RLock()
+	pm, ok := s.perTailnetPolMan[tailnetID]
+	s.perTailnetPolManMu.RUnlock()
 
-		if ok {
-			return pm
-		}
+	if ok {
+		return pm
 	}
 
 	return s.polMan
@@ -1097,11 +1095,7 @@ func (s *State) getPolManForTailnet(tailnetID uint) policy.PolicyManager {
 
 // getPolManForNode returns the PolicyManager scoped to the given node's tailnet.
 func (s *State) getPolManForNode(node types.NodeView) policy.PolicyManager {
-	tailnetID := uint(0)
-	if v, ok := node.TailnetID().GetOk(); ok {
-		tailnetID = v
-	}
-
+	tailnetID, _ := node.TailnetID().GetOk()
 	return s.getPolManForTailnet(tailnetID)
 }
 
@@ -1109,28 +1103,24 @@ func (s *State) getPolManForNode(node types.NodeView) policy.PolicyManager {
 //
 // Resolution order:
 //  1. If the tailnet has an explicit BaseDomain set → use it (operator override).
-//  2. If the tailnet has a Name that isn't "default" → derive as "<name>.<globalBaseDomain>".
+//  2. If the tailnet has a Name → derive as "<name>.<globalBaseDomain>".
 //     This means a single global dns.base_domain (e.g. "ts.example.com") automatically
 //     namespaces each tenant: acme nodes get "acme.ts.example.com", corp gets "corp.ts.example.com".
 //     Auth (pre-auth key / OIDC) is the only thing that determines which tailnet a node joins.
-//  3. Default tailnet or no tailnet → global config BaseDomain as-is.
+//  3. No tailnet or empty name → global config BaseDomain as-is.
 func (s *State) BaseDomainForNode(node types.NodeView) string {
 	globalDomain := s.cfg.DNSConfig.BaseDomain
 
-	tailnetID := uint(0)
-	if v, ok := node.TailnetID().GetOk(); ok {
-		tailnetID = v
-	}
-
-	if tailnetID == 0 {
+	tailnetID, ok := node.TailnetID().GetOk()
+	if !ok || tailnetID == 0 {
 		return globalDomain
 	}
 
 	s.tailnetCacheMu.RLock()
-	tn, ok := s.tailnetCache[tailnetID]
+	tn, found := s.tailnetCache[tailnetID]
 	s.tailnetCacheMu.RUnlock()
 
-	if !ok {
+	if !found {
 		return globalDomain
 	}
 
@@ -1140,8 +1130,7 @@ func (s *State) BaseDomainForNode(node types.NodeView) string {
 	}
 
 	// Auto-derive from tailnet name + global domain — no per-tenant config needed.
-	// "default" tailnet uses the global domain as-is (single-tenant compat).
-	if tn.Name != "" && tn.Name != "default" && globalDomain != "" {
+	if tn.Name != "" && globalDomain != "" {
 		return tn.Name + "." + globalDomain
 	}
 

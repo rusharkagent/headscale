@@ -261,7 +261,7 @@ func (v NodeView) DeletedAt() views.ValuePointer[time.Time] {
 func (v NodeView) IsOnline() views.ValuePointer[bool] { return views.ValuePointerOf(v.ж.IsOnline) }
 
 // TailnetID identifies the tailnet this node belongs to.
-// Nil means the node is in the default (single-tenant) tailnet.
+// Must be non-nil — every node must belong to an explicit tailnet.
 func (v NodeView) TailnetID() views.ValuePointer[uint] { return views.ValuePointerOf(v.ж.TailnetID) }
 
 func (v NodeView) String() string { return v.ж.String() }

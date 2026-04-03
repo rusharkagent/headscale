@@ -743,7 +743,7 @@ WHERE tags IS NOT NULL AND tags != '[]' AND tags != '';
 			{
 				// Multi-tenancy: create tailnets table and add tailnet_id FK
 				// to users, pre_auth_keys, and nodes.
-				// A "default" tailnet is seeded for all existing records.
+				// Every record must belong to an explicit tailnet — there is no default.
 				ID: "202604020000-multi-tenancy-tailnet",
 				Migrate: func(tx *gorm.DB) error {
 					// Create tailnets table.
@@ -752,33 +752,9 @@ WHERE tags IS NOT NULL AND tags != '[]' AND tags != '';
 						return fmt.Errorf("automigrating types.Tailnet: %w", err)
 					}
 
-					// Seed a default tailnet using the configured prefixes/domain.
-					// Use CGNAT defaults if config is not set.
-					ipv4Prefix := "100.64.0.0/10"
-					ipv6Prefix := "fd7a:115c:a1e0::/48"
-					baseDomain := ""
-					if cfg != nil {
-						if cfg.PrefixV4 != nil {
-							ipv4Prefix = cfg.PrefixV4.String()
-						}
-						if cfg.PrefixV6 != nil {
-							ipv6Prefix = cfg.PrefixV6.String()
-						}
-						if cfg.DNSConfig.BaseDomain != "" {
-							baseDomain = cfg.DNSConfig.BaseDomain
-						}
-					}
-
-					err = tx.Exec(`
-INSERT INTO tailnets (name, ipv4_prefix, ipv6_prefix, base_domain, acl_policy, created_at, updated_at)
-VALUES ('default', ?, ?, ?, '', datetime('now'), datetime('now'))
-ON CONFLICT(name) DO NOTHING
-					`, ipv4Prefix, ipv6Prefix, baseDomain).Error
-					if err != nil {
-						return fmt.Errorf("seeding default tailnet: %w", err)
-					}
-
 					// Add tailnet_id FK columns.
+					// This is a strict multi-tenant deployment: no default tailnet is seeded.
+					// New nodes/users/keys must be created with an explicit tailnet_id.
 					for _, stmt := range []string{
 						`ALTER TABLE users ADD COLUMN tailnet_id integer REFERENCES tailnets(id) ON DELETE CASCADE`,
 						`ALTER TABLE pre_auth_keys ADD COLUMN tailnet_id integer REFERENCES tailnets(id) ON DELETE CASCADE`,
@@ -789,17 +765,6 @@ ON CONFLICT(name) DO NOTHING
 							if !isAlreadyExistsError(err) {
 								return fmt.Errorf("adding tailnet_id column (%s): %w", stmt, err)
 							}
-						}
-					}
-
-					// Assign all existing records to the default tailnet.
-					for _, stmt := range []string{
-						`UPDATE users SET tailnet_id = (SELECT id FROM tailnets WHERE name = 'default') WHERE tailnet_id IS NULL`,
-						`UPDATE pre_auth_keys SET tailnet_id = (SELECT id FROM tailnets WHERE name = 'default') WHERE tailnet_id IS NULL`,
-						`UPDATE nodes SET tailnet_id = (SELECT id FROM tailnets WHERE name = 'default') WHERE tailnet_id IS NULL`,
-					} {
-						if err := tx.Exec(stmt).Error; err != nil {
-							return fmt.Errorf("assigning default tailnet (%s): %w", stmt, err)
 						}
 					}
 
